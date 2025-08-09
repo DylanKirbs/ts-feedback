@@ -1,0 +1,16 @@
+language: c
+rules:
+  no-goto:
+    file: queries/no-goto.scm
+    description: "Disallow use of goto statements"
+    severity: error
+    weight: 5
+    fail_if_matches: true
+
+  max-function-length:
+    file: queries/max-function-length.scm
+    description: "Warn if function body exceeds 50 lines"
+    severity: warn
+    weight: 2
+    params:
+      max: 50
