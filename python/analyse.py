@@ -24,6 +24,7 @@ class RuleResult:
     passed: bool
     matches: List[Dict[str, Any]]
     feedback: Optional[str] = None
+    score: float = 1.0
 
 @dataclass
 class FileResult:
@@ -32,14 +33,20 @@ class FileResult:
     results: List[RuleResult]
     total_weight: int
     failed_weight: int
+    total_score: float
+    max_score: float
     
     @property
     def overall_status(self) -> str:
-        if any(r.severity == Severity.ERROR and not r.passed for r in self.results):
+        if any(r.severity == Severity.ERROR and r.score < 1.0 for r in self.results):
             return "FAIL"
-        elif any(r.severity == Severity.WARN and not r.passed for r in self.results):
+        elif any(r.severity == Severity.WARN and r.score < 1.0 for r in self.results):
             return "WARN"
         return "PASS"
+
+    @property
+    def score_ratio(self) -> float:
+        return self.total_score / self.max_score if self.max_score > 0 else 1.0
 
 class LanguageManager:
     LANGUAGE_MAP = {
@@ -159,40 +166,42 @@ class CodeAnalyser:
         return sorted(source_files)
     
     def analyse_file(self, source_file: Path) -> FileResult:
-        """Analyse a single source file against all rules"""
+        """Analyse a single source file against all rules using scoring"""
         try:
             source_code = source_file.read_bytes()
         except Exception as e:
             print(f"ERROR: Cannot read file {source_file}: {e}", file=sys.stderr)
-            return FileResult(str(source_file), self.language, [], 0, 0)
-            
+            # Return zeroed result
+            return FileResult(
+                file_path=str(source_file),
+                language=self.language,
+                results=[],
+                total_weight=0,
+                failed_weight=0,
+                total_score=0.0,
+                max_score=0.0
+            )
+
         results = []
         total_weight = 0
-        failed_weight = 0
-        
+        total_score = 0.0
+
         for rule_name, rule_config in self.meta['rules'].items():
-            # Extract rule configuration
             query_file = self.ruleset_path / rule_config['file']
             description = rule_config.get('description', 'No description')
-            severity = Severity(rule_config.get('severity', 'warn'))
+            severity_str = rule_config.get('severity', 'warn')
+            severity = Severity(severity_str)
             weight = rule_config.get('weight', 1)
             fail_if_matches = rule_config.get('fail_if_matches', True)
             params = rule_config.get('params', {})
             feedback = rule_config.get('feedback')
-            
+
             total_weight += weight
-            
-            # Run the query
+
+            # Run query
             matches = self._run_query(source_code, query_file, params)
-            
-            # Determine if rule passed
-            has_matches = len(matches) > 0
-            passed = not has_matches if fail_if_matches else has_matches
-            
-            if not passed:
-                failed_weight += weight
-            
-            # Format matches for output
+
+            # Format match data
             match_data = []
             for node, capture_name in matches:
                 try:
@@ -206,7 +215,14 @@ class CodeAnalyser:
                     })
                 except Exception as e:
                     print(f"WARNING: Error processing match in {source_file}: {e}", file=sys.stderr)
-                    
+
+            # Scoring Logic
+            score = self.score(params, matches, severity, fail_if_matches)
+
+            passed = score >= 1.0 if severity == Severity.ERROR else score > 0.0
+
+            total_score += score * weight
+
             results.append(RuleResult(
                 rule_name=rule_name,
                 description=description,
@@ -214,16 +230,51 @@ class CodeAnalyser:
                 weight=weight,
                 passed=passed,
                 matches=match_data,
-                feedback=feedback if not passed else None
+                feedback=feedback if not passed and feedback else None,
+                score=score
             ))
-            
+
         return FileResult(
             file_path=str(source_file),
             language=self.language,
             results=results,
             total_weight=total_weight,
-            failed_weight=failed_weight
+            failed_weight=total_weight - int(total_score),
+            total_score=total_score,
+            max_score=float(total_weight)
         )
+
+
+    def score(self, params, matches, severity, fail_if_matches):
+
+        score = 1.0
+        match_count = len(matches)
+
+        if severity == Severity.ERROR:
+                if fail_if_matches:
+                    score = 1.0 if match_count == 0 else 0.0
+                else:
+                    score = 1.0 if match_count > 0 else 0.0
+
+        elif severity == Severity.WARN:
+            max_val = None
+            if 'max_matches' in params:
+                max_val = float(params['max_matches'])
+            elif 'max' in params:  # Backward compatibility
+                max_val = float(params['max'])
+                print("WARNING: Use 'max_matches' instead of 'max' in rule params (deprecated).", file=sys.stderr)
+
+            if max_val is not None:
+                count = float(match_count)
+                if count <= max_val:
+                    score = 1.0
+                else:
+                    score = max(0.0, max_val / count)
+            else:
+                score = 1.0 if match_count == 0 else 0.5
+
+        return score
+
 
 def format_results(file_results: List[FileResult], output_format: str = 'json') -> str:
     if output_format == 'json':
@@ -233,20 +284,22 @@ def format_results(file_results: List[FileResult], output_format: str = 'json') 
                 'passed_files': sum(1 for f in file_results if f.overall_status == 'PASS'),
                 'warned_files': sum(1 for f in file_results if f.overall_status == 'WARN'),
                 'failed_files': sum(1 for f in file_results if f.overall_status == 'FAIL'),
+                'aggregate_score': round(sum(f.total_score for f in file_results) / sum(f.max_score for f in file_results) * 100, 2)
+                if sum(f.max_score for f in file_results) > 0 else 100.0
             },
             'files': []
         }
-        
+
         for file_result in file_results:
             file_data = {
                 'file': file_result.file_path,
                 'language': file_result.language,
                 'status': file_result.overall_status,
+                'score': round(file_result.score_ratio * 100, 2),  # % score
                 'total_weight': file_result.total_weight,
-                'failed_weight': file_result.failed_weight,
                 'rules': []
             }
-            
+
             for rule in file_result.results:
                 rule_data = {
                     'name': rule.rule_name,
@@ -254,14 +307,15 @@ def format_results(file_results: List[FileResult], output_format: str = 'json') 
                     'severity': rule.severity.value,
                     'weight': rule.weight,
                     'passed': rule.passed,
+                    'score': round(rule.score, 3),
                     'matches': rule.matches
                 }
                 if rule.feedback:
                     rule_data['feedback'] = rule.feedback
                 file_data['rules'].append(rule_data)
-                
+
             output['files'].append(file_data)
-            
+
         return json.dumps(output, indent=2)
     
     elif output_format == 'summary':
@@ -270,19 +324,28 @@ def format_results(file_results: List[FileResult], output_format: str = 'json') 
         passed = sum(1 for f in file_results if f.overall_status == 'PASS')
         warned = sum(1 for f in file_results if f.overall_status == 'WARN')
         failed = sum(1 for f in file_results if f.overall_status == 'FAIL')
-        
+
         lines.append(f"Analysis Summary: {total_files} files processed")
         lines.append(f"✓ Passed: {passed}, ⚠ Warned: {warned}, ✗ Failed: {failed}")
+        total_score = sum(f.total_score for f in file_results)
+        max_score = sum(f.max_score for f in file_results)
+        if max_score > 0:
+            lines.append(f"Aggregate Score: {total_score:.1f} / {max_score:.1f} ({total_score/max_score*100:.1f}%)")
         lines.append("")
-        
+
         for file_result in file_results:
-            if file_result.overall_status != 'PASS':
-                lines.append(f"{file_result.overall_status}: {file_result.file_path}")
+            file_score_percent = file_result.score_ratio * 100
+            status_line = f"{file_result.overall_status}: {file_result.file_path} ({file_result.total_score:.1f}/{file_result.max_score:.1f}, {file_score_percent:.1f}%)"
+            if file_result.overall_status == 'PASS':
+                lines.append(status_line)
+            else:
+                lines.append(status_line)
                 for rule in file_result.results:
                     if not rule.passed:
-                        lines.append(f"  [{rule.severity.value.upper()}] {rule.rule_name}: {rule.description}")
+                        lines.append(f"  [{rule.severity.value.upper()}] {rule.rule_name} (x{rule.weight}): {rule.description}")
                         if rule.feedback:
                             lines.append(f"    → {rule.feedback}")
+                        lines.append(f"    Score: {rule.score:.2f}")
                         for match in rule.matches[:3]:
                             lines.append(f"    Line {match['line']}: {match['text'][:60]}...")
                 lines.append("")
